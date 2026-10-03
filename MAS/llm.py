@@ -419,6 +419,11 @@ class OpenRouterLLMClient:
             self._env_int("MAS_SEARCH_TOOL_FAILURE_CIRCUIT_BREAKER") or 2,
         )
         query_search_tools: set[str] = set()
+        # Tools whose schema requires `query` (e.g. BrowseComp `search`) reject an empty
+        # query outright; tools with an optional `query` (e.g. WorkBench
+        # `calendar.search_events`) accept an empty query when another filter such as a
+        # date range is supplied.
+        query_required_search_tools: set[str] = set()
         for tool_def in tool_defs:
             function = tool_def.get("function", {})
             if not isinstance(function, dict):
@@ -429,8 +434,11 @@ class OpenRouterLLMClient:
                 continue
             api_name = str(function.get("name", "")).strip()
             if api_name:
-                query_search_tools.add(api_name)
-                query_search_tools.add(original_tool_names.get(api_name, api_name))
+                names = {api_name, original_tool_names.get(api_name, api_name)}
+                query_search_tools.update(names)
+                required = parameters.get("required", [])
+                if isinstance(required, list) and "query" in required:
+                    query_required_search_tools.update(names)
         # Read-gate: in benchmarks that expose a get_document tool, an agent that
         # searches but never opens a document and then gives up with a blocked /
         # "insufficient evidence" answer is the search-without-reading failure mode.
@@ -618,6 +626,10 @@ class OpenRouterLLMClient:
                     "search" in tool_name_lc
                     and tool_name in query_search_tools
                     and not str(args.get("query", "")).strip()
+                    and (
+                        tool_name in query_required_search_tools
+                        or not self._has_non_query_search_argument(args)
+                    )
                 ):
                     status = "error"
                     error = "Invalid search call: provide a non-empty query string."
@@ -1818,6 +1830,15 @@ class OpenRouterLLMClient:
         if stripped in handlers:
             return stripped
         return name
+
+    @staticmethod
+    def _has_non_query_search_argument(args: dict[str, Any]) -> bool:
+        """Return whether a search call sets a filter other than its free-text query."""
+
+        return any(
+            key != "query" and value is not None and str(value).strip()
+            for key, value in args.items()
+        )
 
     @staticmethod
     def _normalize_tool_arguments(args: dict[str, Any]) -> dict[str, Any]:

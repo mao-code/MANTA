@@ -242,6 +242,36 @@ class _StructuredSearchClient:
         self.chat = SimpleNamespace(completions=_StructuredSearchCompletions())
 
 
+class _SingleToolCallCompletions:
+    def __init__(self, tool_name: str, arguments: dict) -> None:
+        self.calls: list[dict] = []
+        self.tool_name = tool_name
+        self.arguments = arguments
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            tool_call = SimpleNamespace(
+                id="single_call_1",
+                type="function",
+                function=SimpleNamespace(
+                    name=self.tool_name,
+                    arguments=json.dumps(self.arguments),
+                ),
+            )
+            return _make_completion(tool_calls=[tool_call], prompt_tokens=12, completion_tokens=2)
+        return _make_completion(
+            content="FINAL ANSWER: done",
+            prompt_tokens=8,
+            completion_tokens=4,
+        )
+
+
+class _SingleToolCallClient:
+    def __init__(self, tool_name: str, arguments: dict) -> None:
+        self.chat = SimpleNamespace(completions=_SingleToolCallCompletions(tool_name, arguments))
+
+
 class _RateLimitOnceCompletions:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -942,6 +972,67 @@ class TestLLMToolLoop(unittest.TestCase):
         self.assertEqual(received, [{"customer_name": "Taylor"}])
         self.assertEqual(result.tool_calls[0]["status"], "completed")
         self.assertEqual(result.text, "FINAL ANSWER: customer found")
+
+    def _run_single_search_call(
+        self, *, arguments: dict, required: list[str]
+    ) -> tuple[list[dict], object]:
+        client = OpenRouterLLMClient(
+            OpenRouterConfig(api_key="test"), {"default": "openai/gpt-4o-mini"}
+        )
+        client.client = _SingleToolCallClient("calendar_search_events", arguments)
+        received: list[dict] = []
+        result = client.generate(
+            prompt=[{"role": "user", "content": "first event on December 11"}],
+            agent_type="general",
+            task_id="workbench:multi_domain_31",
+            run_index=0,
+            agent_id="agent_0",
+            tools=[
+                {
+                    "name": "calendar.search_events",
+                    "description": "Returns events matching the query and optional time bounds.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "time_min": {"type": "string"},
+                            "time_max": {"type": "string"},
+                        },
+                        "required": required,
+                    },
+                    "handler": lambda args: received.append(args) or [{"event_id": "00000279"}],
+                }
+            ],
+            max_tool_iterations=2,
+        )
+        return received, result
+
+    def test_optional_query_search_with_date_range_reaches_handler(self) -> None:
+        arguments = {"time_min": "2023-12-11 00:00:00", "time_max": "2023-12-11 23:59:59"}
+
+        received, result = self._run_single_search_call(arguments=arguments, required=[])
+
+        self.assertEqual(received, [arguments])
+        self.assertEqual(result.tool_calls[0]["status"], "completed")
+
+    def test_required_query_search_with_empty_query_is_rejected(self) -> None:
+        received, result = self._run_single_search_call(
+            arguments={"query": "", "time_min": "2023-12-11 00:00:00"},
+            required=["query"],
+        )
+
+        self.assertEqual(received, [])
+        self.assertEqual(result.tool_calls[0]["status"], "error")
+        self.assertIn("non-empty query", result.tool_calls[0]["error"])
+
+    def test_optional_query_search_without_any_filter_is_rejected(self) -> None:
+        received, result = self._run_single_search_call(
+            arguments={"query": "  ", "time_min": ""}, required=[]
+        )
+
+        self.assertEqual(received, [])
+        self.assertEqual(result.tool_calls[0]["status"], "error")
+        self.assertIn("non-empty query", result.tool_calls[0]["error"])
 
     def test_retry_adds_openrouter_provider_and_model_fallbacks(self) -> None:
         client = OpenRouterLLMClient(
