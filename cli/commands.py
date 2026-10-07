@@ -145,6 +145,10 @@ def run_command(args: argparse.Namespace) -> int:
         # Explicit id selection: load everything, keep only the requested ids in load
         # order. Overrides offset/limit so a fixed hard-example set reruns identically.
         wanted = set(task_id_filter)
+        restrict = getattr(benchmark, "restrict_to_task_ids", None)
+        if callable(restrict):
+            # Large corpora (BrowseComp-Plus) then keep only the requested tasks in memory.
+            restrict(wanted)
         tasks = [
             task for task in benchmark.load_tasks(task_limit=None) if str(task.task_id) in wanted
         ]

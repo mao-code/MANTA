@@ -599,6 +599,18 @@ class OpenRouterLLMClient:
                         "reason=blocked_finalize_without_read"
                     )
                     continue
+                if not assistant_text.strip():
+                    # The model answered with nothing (no text, no tool call). At
+                    # temperature 0 a retry repeats it, so ask once for a final answer,
+                    # as at the tool-call limit. The empty turn is not kept.
+                    stopped_early = True
+                    stop_reason = "empty_reply"
+                    self._log(
+                        "TOOL_LOOP_STOP "
+                        f"request_id={request_id} task_id={task_id} run_index={run_index} "
+                        f"agent_id={agent_id} reason=empty_reply iteration={iteration_index + 1}"
+                    )
+                    break
                 tool_turns.append(current_turn)
                 break
 
@@ -938,6 +950,10 @@ class OpenRouterLLMClient:
                 )
                 metadata["empty_completion"] = True
                 metadata["failure_category"] = "empty_completion"
+            elif stop_reason == "empty_reply":
+                metadata["tool_loop_stopped_reason"] = (
+                    "The model returned an empty reply; it was asked once for a final answer."
+                )
             else:
                 metadata["tool_loop_stopped_reason"] = (
                     f"Reached max_tool_iterations={max(1, int(max_tool_iterations))}"
@@ -1574,13 +1590,19 @@ class OpenRouterLLMClient:
                     ),
                 }
             )
+        if stop_reason == "empty_reply":
+            closing = "Your previous reply was empty. "
+        else:
+            closing = (
+                "You have reached the maximum number of tool calls "
+                f"({max(1, int(max_tool_iterations))}). "
+            )
         follow_up_messages.append(
             {
                 "role": "user",
                 "content": (
-                    "You have reached the maximum number of tool calls "
-                    f"({max(1, int(max_tool_iterations))}). "
-                    "Based only on the information already gathered, provide your best final answer now. "
+                    closing
+                    + "Based only on the information already gathered, provide your best final answer now. "
                     "Do not call any more tools."
                 ),
             }

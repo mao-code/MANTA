@@ -88,6 +88,7 @@ confidence: The extracted confidence score between 0|%| and 100|%| from \
 """
 
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
+_QUERY_ID_PREFIX = re.compile(rb'\{"query_id": "([^"]+)"')
 _STOPWORDS = {
     "a",
     "about",
@@ -379,24 +380,41 @@ class BrowseCompBenchmark:
         self._qrel_evidence: dict[str, set[str]] | None = None
         self._qrel_golds: dict[str, set[str]] | None = None
         self._task_docs: dict[str, list[dict[str, str]]] = {}
+        # When set, load_tasks keeps only these tasks. Search reads only the current task's
+        # documents, so this changes no result; it avoids holding the whole 2 GB corpus.
+        self._only_task_ids: set[str] | None = None
 
     # ------------------------------------------------------------------
     # BenchmarkAdapter interface
     # ------------------------------------------------------------------
+
+    def restrict_to_task_ids(self, task_ids: set[str]) -> None:
+        """Make the next ``load_tasks`` keep only these task ids (and their documents)."""
+
+        self._only_task_ids = {str(task_id) for task_id in task_ids}
 
     def load_tasks(self, task_limit: int | None = None) -> Sequence[BenchmarkTask]:
         decrypted_path = self._ensure_decrypted_dataset()
         tasks: list[BenchmarkTask] = []
         self._task_docs = {}
 
-        with decrypted_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
+        # Read bytes and decode row by row: decoding the 12 MB rows as one text stream
+        # costs about 0.5 GB of memory per process.
+        with decrypted_path.open("rb") as handle:
+            for raw in handle:
+                if self._only_task_ids is not None:
+                    # Rows start with their query id, so unwanted rows are skipped undecoded.
+                    head = _QUERY_ID_PREFIX.match(raw[:200])
+                    if head and head.group(1).decode("utf-8") not in self._only_task_ids:
+                        continue
+                line = raw.decode("utf-8").strip()
                 if not line:
                     continue
                 row = json.loads(line)
                 task_id = str(row.get("query_id", ""))
                 if not task_id:
+                    continue
+                if self._only_task_ids is not None and task_id not in self._only_task_ids:
                     continue
 
                 gold_docs = row.get("gold_docs") or []

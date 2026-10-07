@@ -115,6 +115,16 @@ class WorkBenchSandbox:
             dtype=str,
         )
 
+    def fork(self) -> WorkBenchSandbox:
+        """Return an independent copy of the current state (used for dry-run checks)."""
+
+        copy = object.__new__(WorkBenchSandbox)
+        copy.data_root = self.data_root
+        for name, value in vars(self).items():
+            if isinstance(value, pd.DataFrame):
+                setattr(copy, name, value.copy())
+        return copy
+
     def snapshot(self) -> dict[str, pd.DataFrame]:
         return {
             "calendar": self.calendar_events.copy(),
@@ -1064,6 +1074,12 @@ class WorkBenchBenchmark:
                         "required": list(spec.get("required", [])),
                     },
                     "handler": lambda args, tool_name=name, sb=sandbox: sb.invoke(tool_name, args),
+                    "side_effect": name in SIDE_EFFECT_TOOLS,
+                    # Runs the call on a throwaway copy; systems that defer writes use it to
+                    # validate a proposed write without changing the shared state.
+                    "dry_run_handler": (
+                        lambda args, tool_name=name, sb=sandbox: sb.fork().invoke(tool_name, args)
+                    ),
                 }
             )
         return tools
@@ -1159,6 +1175,27 @@ class WorkBenchBenchmark:
     ) -> list[str]:
         artifact_records = run_metadata.get("artifact_records", [])
         selected_artifact_id = run_metadata.get("selected_artifact_id")
+        committed = run_metadata.get("committed_actions")
+        if isinstance(committed, list):
+            # Commit-once runs: writes made during the run were only proposals; the
+            # committed list is the only set of writes that reached the environment.
+            lineage = (
+                collect_lineage_tool_records(artifact_records, selected_artifact_id)
+                if isinstance(artifact_records, list) and selected_artifact_id
+                else []
+            )
+            reads = [
+                record
+                for record in lineage
+                if isinstance(record, dict)
+                and str(record.get("tool_name", "")) not in SIDE_EFFECT_TOOLS
+            ]
+            writes = [
+                record
+                for record in committed
+                if isinstance(record, dict) and str(record.get("status", "")) == "completed"
+            ]
+            return cls._extract_function_calls_from_tool_records(reads + writes)
         if isinstance(artifact_records, list) and selected_artifact_id:
             lineage_tool_records = collect_lineage_tool_records(artifact_records, selected_artifact_id)
             if lineage_tool_records:

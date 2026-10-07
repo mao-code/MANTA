@@ -284,6 +284,7 @@ class PlaybookMaintainer:
         mutation_payload: dict[str, Any] | None,
         mutation_payloads: list[dict[str, Any]],
         termination_decision: dict[str, Any],
+        state_changing: bool = False,
     ) -> dict[str, Any]:
         audit_modes = sorted(
             {
@@ -318,6 +319,7 @@ class PlaybookMaintainer:
             "termination_reason": str(termination_decision.get("reason", "")),
             "consensus_ratio": float(termination_decision.get("consensus_ratio", 0.0)),
             "average_confidence": float(termination_decision.get("average_confidence", 0.0)),
+            "state_changing_tools": bool(state_changing),
         }
 
 

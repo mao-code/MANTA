@@ -382,6 +382,9 @@ class TraceAuditorAgent:
             mutation_tool_names = state_changing_tool_names(
                 [tool for tool in run_tools if isinstance(tool, dict)]
             )
+        if str(state.get("self_evolved_write_protocol", "")) == "commit_once":
+            # Proposals are committed once from the selected answer; repeats are harmless.
+            mutation_tool_names = set()
         sig_agents: dict[str, set[str]] = {}
         for record in turn_calls:
             name = str(record.get("tool_name", "")).strip()

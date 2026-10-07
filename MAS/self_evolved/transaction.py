@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -80,6 +82,123 @@ def successful_mutation_record(
     return not (
         isinstance(output, str) and _FAILED_MUTATION_OUTPUT_RE.search(output)
     )
+
+
+PROPOSAL_NOTE = (
+    "Recorded as a proposed change; external state is unchanged. After the run, only the "
+    "proposals of the selected final answer are executed, exactly once."
+)
+
+
+def wrap_write_tools_as_proposals(
+    tools: list[dict[str, Any]], mutation_tool_names: set[str]
+) -> tuple[list[dict[str, Any]], dict[str, Callable[[dict[str, Any]], Any]]]:
+    """Make state-changing tools record proposals instead of changing state.
+
+    A proposal is first checked with the tool's optional ``dry_run_handler`` (which runs
+    the call on a throwaway copy of the environment), so invalid arguments still fail
+    visibly. Returns the wrapped tools and the original handlers for the final commit.
+    """
+
+    wrapped: list[dict[str, Any]] = []
+    handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
+    for tool in tools:
+        name = str(tool.get("name", "")) if isinstance(tool, dict) else ""
+        handler = tool.get("handler") if isinstance(tool, dict) else None
+        if name not in mutation_tool_names or not callable(handler):
+            wrapped.append(tool)
+            continue
+        handlers[name] = handler
+        dry_run = tool.get("dry_run_handler")
+
+        def propose(arguments: dict[str, Any], _dry_run: Any = dry_run) -> dict[str, Any]:
+            validation = _dry_run(dict(arguments or {})) if callable(_dry_run) else None
+            return {
+                "status": "proposed",
+                "validation_result": _jsonable(validation),
+                "note": PROPOSAL_NOTE,
+            }
+
+        wrapped.append({**tool, "handler": propose})
+    return wrapped, handlers
+
+
+def select_commit_proposals(
+    artifacts: list[dict[str, Any]],
+    selected_artifact_id: str,
+    mutation_tool_names: set[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Return the selected answer's write proposals, without exact repeats.
+
+    Walk the lineage from the selected artifact to the nearest artifact that proposed a
+    write; that stage owns the decision. Later stages that only re-read the data keep the
+    earlier proposals, and a later stage that proposes again replaces them.
+    """
+
+    by_id = {
+        str(artifact.get("artifact_id", "")): artifact
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+    }
+    queue = [str(selected_artifact_id or "")]
+    seen: set[str] = set()
+    while queue:
+        artifact_id = queue.pop(0)
+        if not artifact_id or artifact_id in seen or artifact_id not in by_id:
+            continue
+        seen.add(artifact_id)
+        artifact = by_id[artifact_id]
+        proposals: list[dict[str, Any]] = []
+        keys: set[str] = set()
+        for record in artifact.get("tool_records", []) or []:
+            if not isinstance(record, dict):
+                continue
+            if not successful_mutation_record(record, mutation_tool_names):
+                continue
+            arguments = record.get("arguments")
+            arguments = dict(arguments) if isinstance(arguments, dict) else {}
+            key = f"{record.get('tool_name')}:{json.dumps(arguments, sort_keys=True, default=str)}"
+            if key in keys:
+                continue
+            keys.add(key)
+            proposals.append({"tool_name": str(record.get("tool_name")), "arguments": arguments})
+        if proposals:
+            return artifact_id, proposals
+        queue.extend(str(source) for source in artifact.get("source_artifact_ids", []) or [])
+    return "", []
+
+
+def commit_proposals(
+    proposals: list[dict[str, Any]],
+    handlers: dict[str, Callable[[dict[str, Any]], Any]],
+) -> list[dict[str, Any]]:
+    """Execute each proposal once, in order, with the original state-changing handler."""
+
+    committed: list[dict[str, Any]] = []
+    for proposal in proposals:
+        name = str(proposal.get("tool_name", ""))
+        arguments = dict(proposal.get("arguments") or {})
+        entry: dict[str, Any] = {"tool_name": name, "arguments": arguments}
+        handler = handlers.get(name)
+        if handler is None:
+            entry.update(status="error", error=f"no handler for {name}")
+        else:
+            try:
+                entry.update(status="completed", output=_jsonable(handler(dict(arguments))))
+            except Exception as exc:
+                entry.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        committed.append(entry)
+    return committed
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
 
 
 def parse_duration_minutes(raw: Any, default: int = 30) -> int:

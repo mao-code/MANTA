@@ -93,6 +93,18 @@ _TOOL_CHAIN_DIRECTIVE = (
     "a more canonical argument instead of abandoning the tool."
 )
 
+_COMMIT_ONCE_DIRECTIVE = (
+    " WRITE PROTOCOL: State-changing tools change nothing during the run. Each call is "
+    "checked and recorded as a proposal. After the run, the proposals of the agent "
+    "closest to the selected final answer are executed, exactly once. Gather the facts "
+    "with read tools first. If the task's condition requires a change, call the "
+    "state-changing tool once with the exact final arguments. Do not stop at a plan or "
+    "claim success without recording the proposal. If the condition does not hold, call "
+    "no state-changing tool and state the evidence. If an earlier agent's proposal is "
+    "correct, do not repeat it. If it is wrong, call the tool again with the corrected "
+    "arguments, because your proposals replace the earlier ones. "
+)
+
 
 _INDEPENDENT_ROUTES = (
     "derive the answer from first principles and expose the critical intermediate checks",
@@ -142,6 +154,12 @@ def state_changing_tool_names(tools: list[dict[str, Any]]) -> set[str]:
         if not isinstance(tool, dict):
             continue
         name = str(tool.get("name", "")).strip()
+        declared = tool.get("side_effect")
+        if isinstance(declared, bool):
+            # The benchmark adapter knows which tools change its environment.
+            if declared:
+                names.add(name)
+            continue
         leaf = name.rsplit(".", 1)[-1].casefold()
         tokens = set(re.findall(r"[a-z]+", leaf))
         if tokens & _MUTATION_VERBS:
@@ -619,6 +637,25 @@ class TurnExecutor:
                         "invent an availability precondition; report the complete proposed "
                         "calendar.create_event arguments to the committer. "
                     )
+        if str(state.get("self_evolved_write_protocol", "")) == "commit_once":
+            directive = f"{directive}{_COMMIT_ONCE_DIRECTIVE}"
+            tool_names = {str(tool.get("name", "")) for tool in all_tools}
+            calendar_mode = str(
+                state.get("self_evolved_calendar_scheduling_mode", "")
+            ).casefold()
+            if (
+                calendar_mode == "flexible"
+                and "calendar.find_first_available_slot" in tool_names
+            ):
+                directive += (
+                    "For availability, call calendar.find_first_available_slot (duration is "
+                    "whole minutes, e.g. '30') and use its event_start exactly. "
+                )
+            elif calendar_mode == "fixed":
+                directive += (
+                    "The user supplied a fixed calendar time. Use it exactly and do not add "
+                    "an availability precondition. "
+                )
         repair_directive = str(state.get("self_evolved_repair_directive", "")).strip()
         if int(state.get("round_index", 0)) > 0 and repair_directive:
             directive = (

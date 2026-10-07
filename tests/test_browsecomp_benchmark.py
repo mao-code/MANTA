@@ -224,6 +224,31 @@ class TestCitations(unittest.TestCase):
         self.assertEqual(metrics["precision"], 0.0)
         self.assertEqual(metrics["recall"], 0.0)
 
+    def test_restricted_load_keeps_only_requested_tasks_with_same_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decrypted = Path(tmpdir) / "decrypted.jsonl"
+            rows = [
+                {
+                    "query_id": qid,
+                    "query": f"question {qid}",
+                    "answer": qid,
+                    "gold_docs": [{"docid": f"g{qid}", "text": f"gold {qid}", "url": "u"}],
+                }
+                for qid in ("q1", "q2", "q3")
+            ]
+            decrypted.write_text("".join(json.dumps(row) + "\n" for row in rows), "utf-8")
+            config = {"decrypted_path": str(decrypted), "eval_mode": "substring"}
+
+            full = BrowseCompBenchmark(config)
+            full.load_tasks()
+            restricted = BrowseCompBenchmark(config)
+            restricted.restrict_to_task_ids({"q2"})
+            tasks = restricted.load_tasks()
+
+            self.assertEqual([task.task_id for task in tasks], ["q2"])
+            self.assertEqual(list(restricted._task_docs), ["q2"])
+            self.assertEqual(restricted._task_docs["q2"], full._task_docs["q2"])
+
 
 if __name__ == "__main__":
     unittest.main()

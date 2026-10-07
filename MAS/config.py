@@ -199,6 +199,16 @@ class SelfEvolvedConfig:
     # scripts/reflect_topology_skill.py).
     skill_update_batch_size: int = 12
     default_packet_max_chars: int = 0  # 0 = full fidelity; optional generous structural budget
+    # How runs with state-changing tools are protected from duplicate writes.
+    # "transactional_star": contract every topology into readers -> one committer star.
+    # "commit_once": keep the planned topology; write calls are validated and recorded as
+    # proposals, and the selected answer's proposals execute once after finalize.
+    write_protocol: str = "transactional_star"
+    # How the reflection agent turns run outcomes into lessons.
+    # "batch": the agent reads the latest batch's raw process counts (original behaviour).
+    # "evidence_gated": the agent reads all runs so far, and may state only topology
+    # comparisons that pass a significance test computed in code (skill.supported_findings).
+    reflection_mode: str = "batch"
 
     def validate(self) -> None:
         if self.harness_backend not in {"openrouter", "claude_agent_sdk"}:
@@ -228,6 +238,12 @@ class SelfEvolvedConfig:
             raise ValueError("self_evolved.skill_update_batch_size must be >= 0")
         if self.default_packet_max_chars < 0:
             raise ValueError("self_evolved.default_packet_max_chars must be >= 0")
+        if self.write_protocol not in {"transactional_star", "commit_once"}:
+            raise ValueError(
+                "self_evolved.write_protocol must be one of: transactional_star, commit_once"
+            )
+        if self.reflection_mode not in {"batch", "evidence_gated"}:
+            raise ValueError("self_evolved.reflection_mode must be one of: batch, evidence_gated")
 
 
 @dataclass
@@ -364,6 +380,8 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         playbook_read=bool(self_evolved_raw.get("playbook_read", True)),
         skill_update_batch_size=int(self_evolved_raw.get("skill_update_batch_size", 12)),
         default_packet_max_chars=int(self_evolved_raw.get("default_packet_max_chars", 0)),
+        write_protocol=str(self_evolved_raw.get("write_protocol", "transactional_star")),
+        reflection_mode=str(self_evolved_raw.get("reflection_mode", "batch")),
     )
 
     models = {str(key): str(value) for key, value in models_raw.items()}

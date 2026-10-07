@@ -1102,6 +1102,70 @@ class TestLLMToolLoop(unittest.TestCase):
         self.assertTrue(result.metadata.get("empty_completion"))
         self.assertEqual(result.metadata.get("failure_category"), "empty_completion")
 
+    def _empty_reply_run(self, final_text: str):
+        calls: list[dict] = []
+
+        class _Completions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if "tools" not in kwargs:
+                    return _make_completion(content=final_text, prompt_tokens=5, completion_tokens=4)
+                if sum("tools" in call for call in calls) == 1:
+                    tool_call = SimpleNamespace(
+                        id="call_1",
+                        type="function",
+                        function=SimpleNamespace(name="search_tool", arguments='{"query":"x"}'),
+                    )
+                    return _make_completion(tool_calls=[tool_call], prompt_tokens=10)
+                return _make_completion(content="", prompt_tokens=10)
+
+        client = OpenRouterLLMClient(
+            OpenRouterConfig(api_key="test"), {"default": "google/gemma-4-31b-it"}
+        )
+        client.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+        with patch.dict("os.environ", {"MAS_LLM_RETRY_BACKOFF_S": "0"}, clear=False):
+            result = client.generate(
+                prompt=[{"role": "user", "content": "solve this"}],
+                agent_type="general",
+                task_id="t1",
+                run_index=0,
+                agent_id="agent_0",
+                tools=[
+                    {
+                        "name": "search.tool",
+                        "description": "Search tool",
+                        "parameters": {"type": "object", "properties": {}, "required": []},
+                        "handler": lambda args: [],
+                    }
+                ],
+                max_tool_iterations=5,
+            )
+        return result, calls
+
+    def test_empty_reply_after_tool_results_asks_once_for_a_final_answer(self) -> None:
+        from cli.resume import _llm_payload_needs_rerun
+
+        result, calls = self._empty_reply_run("FINAL ANSWER: recovered")
+
+        self.assertEqual(result.text, "FINAL ANSWER: recovered")
+        self.assertTrue(result.metadata.get("tool_loop_forced_final_answer"))
+        self.assertEqual(result.metadata.get("generation_status"), "answered")
+        self.assertNotIn("failure_category", result.metadata)
+        self.assertIn("previous reply was empty", calls[-1]["messages"][-1]["content"])
+        self.assertFalse(
+            _llm_payload_needs_rerun({"mock_used": False, "metadata": result.metadata})
+        )
+
+    def test_empty_reply_that_stays_empty_still_marks_the_run_for_rerun(self) -> None:
+        from cli.resume import _llm_payload_needs_rerun
+
+        result, _ = self._empty_reply_run("")
+
+        self.assertEqual(result.metadata.get("generation_status"), "failed")
+        self.assertTrue(
+            _llm_payload_needs_rerun({"mock_used": False, "metadata": result.metadata})
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

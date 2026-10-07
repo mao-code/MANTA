@@ -389,6 +389,10 @@ def _load_reflection_state(state_root: Path, variant: Variant) -> dict[str, Any]
     state.setdefault("pending", [])
     state.setdefault("updates", [])
     state.setdefault("inflight", None)
+    # Used only by self_evolved.reflection_mode = "evidence_gated": the summaries of all
+    # reflected runs, and the supported findings behind the last applied update.
+    state.setdefault("history", [])
+    state.setdefault("findings", None)
     return state
 
 
@@ -444,6 +448,8 @@ def _resume_inflight_reflection(
             "skill_sha256": _sha256(skill_path),
         }
     )
+    state["history"] = list(state["history"]) + list(inflight.get("summaries", []))
+    state["findings"] = None
     state["inflight"] = None
     _save_reflection_state(state_root, variant, state)
     return True
@@ -480,11 +486,16 @@ def _reflect_pending(
         client = OpenRouterLLMClient(config.openrouter, config.models)
         reflector = SkillReflector(client, config.self_evolved)
         skill = TopologySkill.load(skill_path)
+        summaries = [dict(row["summary"]) for row in batch]
         result = reflector.reflect(
             current_skill=skill.text,
-            run_summaries=[dict(row["summary"]) for row in batch],
+            run_summaries=summaries,
+            history=list(state["history"]) + summaries,
+            previous_findings=state["findings"],
         )
+        state["history"] = list(state["history"]) + summaries
         if result.changed:
+            state["findings"] = list(result.findings)
             skill.save(result.skill_markdown)
         state["updates"].append(
             {

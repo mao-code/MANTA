@@ -484,6 +484,10 @@ def _load_reflection_state(state_root: Path, source: str) -> dict[str, Any]:
     state.setdefault("pending", [])
     state.setdefault("updates", [])
     state.setdefault("inflight", None)
+    # Used only by self_evolved.reflection_mode = "evidence_gated": the summaries of all
+    # reflected runs, and the supported findings behind the last applied update.
+    state.setdefault("history", [])
+    state.setdefault("findings", None)
     return state
 
 
@@ -538,6 +542,10 @@ def _recover_inflight_reflection(state_root: Path, source: str) -> None:
         pending_keys = [str(row.get("run_key", "")) for row in state["pending"]]
         if pending_keys[: len(run_keys)] != run_keys:
             raise RuntimeError(f"Reflection recovery state is inconsistent for source={source}")
+        state["history"] = list(state["history"]) + [
+            dict(row["summary"]) for row in state["pending"][: len(run_keys)]
+        ]
+        state["findings"] = None
         state["pending"] = state["pending"][len(run_keys) :]
         state["updates"].append(
             {
@@ -577,9 +585,12 @@ def _reflect_pending(
 
         config = load_experiment_config(config_path)
         client = OpenRouterLLMClient(config.openrouter, config.models)
+        summaries = [dict(row["summary"]) for row in batch]
         result = SkillReflector(client, config.self_evolved).reflect(
             current_skill=TopologySkill.load(skill_path).text,
-            run_summaries=[dict(row["summary"]) for row in batch],
+            run_summaries=summaries,
+            history=list(state["history"]) + summaries,
+            previous_findings=state["findings"],
         )
         if result.changed:
             TopologySkill.load(skill_path).save(result.skill_markdown)
@@ -590,6 +601,9 @@ def _reflect_pending(
         if pending_keys[:REFLECTION_BATCH_SIZE] != batch_keys:
             raise RuntimeError(f"Reflection state changed unexpectedly for source={source}")
         state["pending"] = state["pending"][REFLECTION_BATCH_SIZE:]
+        state["history"] = list(state["history"]) + summaries
+        if result.changed:
+            state["findings"] = list(result.findings)
         state["updates"].append(
             {
                 "run_keys": batch_keys,

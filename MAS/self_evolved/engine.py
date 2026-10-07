@@ -55,7 +55,10 @@ from .spec import AgentNode, ContextPolicy, GroupSpec, TopologySpec
 from .transaction import (
     augment_with_transaction_tools,
     calendar_scheduling_mode,
+    commit_proposals,
+    select_commit_proposals,
     successful_mutation_record,
+    wrap_write_tools_as_proposals,
 )
 
 
@@ -125,7 +128,21 @@ class SelfEvolvedEngine:
             task, num_agents, str(spec.benchmark_name or ""), bool(tools)
         )
         mutation_tool_names = state_changing_tool_names(list(tools or []))
-        if mutation_tool_names:
+        commit_once = (
+            bool(mutation_tool_names) and self.se_config.write_protocol == "commit_once"
+        )
+        commit_handlers: dict[str, Any] = {}
+        if commit_once:
+            # The planned topology is kept; writes become proposals committed once.
+            tools, commit_handlers = wrap_write_tools_as_proposals(
+                list(tools or []), mutation_tool_names
+            )
+            plan_payload["transaction_protocol"] = {
+                "mutation_tools": sorted(mutation_tool_names),
+                "policy": "commit_once",
+                "calendar_scheduling_mode": calendar_mode,
+            }
+        elif mutation_tool_names:
             topo_spec = self._transactional_star_spec(
                 topo_spec, minimum_agents=min(3, max(2, num_agents))
             )
@@ -163,7 +180,10 @@ class SelfEvolvedEngine:
             role_assignment_payload=role_assignment_payload,
             workflow_definition=workflow_definition,
         )
-        if mutation_tool_names:
+        if commit_once:
+            state["self_evolved_write_protocol"] = "commit_once"
+            state["self_evolved_calendar_scheduling_mode"] = calendar_mode
+        elif mutation_tool_names:
             state["self_evolved_mutation_tool_names"] = sorted(mutation_tool_names)
             state["self_evolved_committer_id"] = str(
                 topo_spec.group(topo_spec.root_group_id).leader_id or ""
@@ -247,7 +267,8 @@ class SelfEvolvedEngine:
 
             mutations_used = len(spec_versions) - 1
             repeated_decision = self._repair_repeated_decision(turn_results)
-            transaction_committed = bool(mutation_tool_names) and any(
+            # Under commit_once nothing is committed before finalize, so repair stays open.
+            transaction_committed = bool(mutation_tool_names) and not commit_once and any(
                 successful_mutation_record(record, mutation_tool_names)
                 for record in state.get("tool_records_log", [])
                 if isinstance(record, dict)
@@ -354,7 +375,7 @@ class SelfEvolvedEngine:
                 )
                 break
             topo_spec, mutation_payload = mutated
-            if mutation_tool_names:
+            if mutation_tool_names and not commit_once:
                 topo_spec = self._transactional_star_spec(
                     topo_spec, minimum_agents=min(3, max(2, num_agents))
                 )
@@ -385,6 +406,31 @@ class SelfEvolvedEngine:
             decision,
             turn_results=turn_results,
         )
+        if commit_once:
+            source_artifact_id, proposals = select_commit_proposals(
+                list(state.get("artifacts", [])),
+                str(state.get("selected_artifact_id", "")),
+                mutation_tool_names,
+            )
+            commit_payload = {
+                "policy": "commit_once",
+                "source_artifact_id": source_artifact_id,
+                "proposals_in_run": sum(
+                    1
+                    for record in state.get("tool_records_log", [])
+                    if isinstance(record, dict)
+                    and successful_mutation_record(record, mutation_tool_names)
+                ),
+                "committed": commit_proposals(proposals, commit_handlers),
+            }
+            state["self_evolved_commit"] = commit_payload
+            self._emit_meta_event(
+                state,
+                actor="transaction_committer",
+                event_type="act",
+                node_name="self_evolved_commit",
+                payload=commit_payload,
+            )
 
         # 8. RECORD — long-term playbook candidate; runs never write the
         # persistent playbook file (see scripts/update_topology_playbook.py).
@@ -397,6 +443,7 @@ class SelfEvolvedEngine:
             mutation_payload=mutation_payload,
             mutation_payloads=mutation_payloads,
             termination_decision=dict(decision or {}),
+            state_changing=bool(mutation_tool_names),
         )
         self._emit_meta_event(
             state,
@@ -3281,7 +3328,7 @@ class SelfEvolvedEngine:
             for agent_id, artifact in latest_artifact_by_agent(artifacts).items()
         }
         tool_call_counts = self._stage._count_tool_calls(state)
-        return {
+        metadata = {
             "task_id": state.get("task_id"),
             "run_index": run_index,
             "seed": seed,
@@ -3342,5 +3389,11 @@ class SelfEvolvedEngine:
                 "contract_repairs": list(state.get("self_evolved_contract_repairs", [])),
                 "temporal_candidates": list(state.get("self_evolved_temporal_candidates", [])),
                 "playbook_update_candidate": playbook_candidate,
+                "write_commit": state.get("self_evolved_commit"),
             },
         }
+        commit = state.get("self_evolved_commit")
+        if isinstance(commit, dict):
+            # Benchmarks that score external state read the committed writes from here.
+            metadata["committed_actions"] = list(commit.get("committed", []))
+        return metadata
